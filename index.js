@@ -1,450 +1,531 @@
 // ================================
-// MyCoder Backend (index.js) — Responses API streaming
+// MyCoder Backend (index.js)
 // ================================
 
 require('dotenv').config();
 const express = require('express');
-const multer = require('multer');
+const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
-const path = require('path');
+const multer = require('multer');
+const axios = require('axios');
 const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
 
 const app = express();
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Serve frontend
+// ---- Static front-end
 app.use(express.static(path.join(__dirname, 'public')));
-// Quiet dev favicon 404
-app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
-// ---------- directories ----------
+// ---- Storage layout
 const DATA_DIR = path.join(__dirname, 'data');
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-const LIB_DIR = path.join(UPLOADS_DIR, 'library');
-const CHATS_DIR = path.join(UPLOADS_DIR, 'chats');
-for (const p of [DATA_DIR, UPLOADS_DIR, LIB_DIR, CHATS_DIR]) {
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+const CHAT_DIR = path.join(DATA_DIR, 'chats');
+const LIB_DIR = path.join(DATA_DIR, 'library');
+const TMP_DIR = path.join(__dirname, 'uploads');
+
+for (const d of [DATA_DIR, CHAT_DIR, LIB_DIR, TMP_DIR]) {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
-const LIB_INDEX = path.join(DATA_DIR, 'library.json');
-if (!fs.existsSync(LIB_INDEX)) fs.writeFileSync(LIB_INDEX, JSON.stringify([]));
 
-// ---------- multer ----------
-const uploadTemp = multer({ dest: path.join(UPLOADS_DIR, 'tmp') });
-const uploadLibrary = multer({ dest: LIB_DIR });
+// ---- Multer temp upload
+const upload = multer({ dest: TMP_DIR });
 
-// ---------- utils ----------
-async function readFileSmart(filePath, originalName) {
-  const lower = (originalName || '').toLowerCase();
+// ---- OpenAI
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_BASE = process.env.OPENAI_BASE || 'https://api.openai.com';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o'; // high-end
+const PER_TOKEN_USD = 0.000002; // loose estimate for input tokens; you can tune per model
+
+function assertApiKey() {
+  if (!OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY in .env');
+}
+
+// ---- Util
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function safeName(name) {
+  return name.replace(/[^\w.\-()+\s]/g, '_');
+}
+
+async function extractText(filePath, originalname, mimetype) {
+  const ext = (path.extname(originalname || '').toLowerCase());
   try {
-    if (lower.endsWith('.pdf')) {
-      const data = await pdfParse(await fsp.readFile(filePath));
+    if (ext === '.pdf' || mimetype === 'application/pdf') {
+      const data = await pdfParse(fs.readFileSync(filePath));
       return data.text || '';
+    } else if (ext === '.docx' || mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+      const { value } = await mammoth.extractRawText({ path: filePath });
+      return value || '';
+    } else if (ext === '.txt' || mimetype?.startsWith('text/')) {
+      return fs.readFileSync(filePath, 'utf8');
+    } else {
+      // Fallback: try utf8 read
+      try { return fs.readFileSync(filePath, 'utf8'); }
+      catch { return ''; }
     }
-    return await fsp.readFile(filePath, 'utf8');
-  } catch {
-    return `[binary or unreadable content for ${originalName}]`;
+  } catch (e) {
+    console.warn('extractText failed for', originalname, e.message);
+    return '';
   }
 }
-const safeName = (s) => (s || '').replace(/[\/\\]+/g, '_');
-function chatDir(chatId) { return path.join(CHATS_DIR, safeName(chatId || 'default')); }
-async function ensureChatDir(chatId) {
-  const dir = chatDir(chatId);
-  if (!fs.existsSync(dir)) await fsp.mkdir(dir, { recursive: true });
-  return dir;
+
+function tokensFromChars(chars) {
+  // rough rule of thumb ~4 chars per token
+  return Math.ceil(chars / 4);
 }
+
+function truncateByBudget(str, maxChars) {
+  if (str.length <= maxChars) return str;
+  return str.slice(0, maxChars) + '\n\n[truncated]';
+}
+
+async function ensureDir(p) {
+  await fsp.mkdir(p, { recursive: true });
+}
+
 async function listChatFiles(chatId) {
-  const dir = chatDir(chatId);
-  if (!fs.existsSync(dir)) return [];
-  const names = await fsp.readdir(dir);
-  const out = [];
-  for (const n of names) {
-    const p = path.join(dir, n);
-    const st = await fsp.stat(p);
-    if (st.isFile()) out.push({ name: n, size: st.size, uploadedAt: st.mtimeMs });
+  const dir = path.join(CHAT_DIR, chatId);
+  try {
+    const files = await fsp.readdir(dir);
+    return await Promise.all(files.map(async f => {
+      const p = path.join(dir, f);
+      const stat = await fsp.stat(p);
+      return { name: f, size: stat.size, path: p };
+    }));
+  } catch {
+    return [];
   }
-  return out.sort((a, b) => a.uploadedAt - b.uploadedAt);
 }
 
-// ---------- health ----------
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
-
-// ---------- library (global) ----------
-function loadLib() { return JSON.parse(fs.readFileSync(LIB_INDEX, 'utf8')); }
-function saveLib(items) { fs.writeFileSync(LIB_INDEX, JSON.stringify(items, null, 2)); }
-
-app.get('/api/library', (_req, res) => res.json(loadLib()));
-
-app.post('/api/library/upload', uploadLibrary.array('files'), async (req, res) => {
+async function readPinnedIds() {
+  const pinPath = path.join(LIB_DIR, '.pins.json');
   try {
-    const collection = req.body.collection || 'default';
-    const items = loadLib();
-    const newItems = await Promise.all((req.files || []).map(async f => {
-      const id = `${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
-      const dest = path.join(LIB_DIR, f.filename); // already saved
-      const stats = await fsp.stat(dest);
-      const meta = {
-        id, filename: f.originalname, storedName: f.filename,
-        size: stats.size, uploadedAt: Date.now(), collection, pinned: false
-      };
-      items.push(meta);
-      return meta;
-    }));
-    saveLib(items);
-    res.json({ ok: true, added: newItems.length, items: newItems });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'Upload failed' }); }
+    return JSON.parse(await fsp.readFile(pinPath, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+async function writePinnedIds(arr) {
+  const pinPath = path.join(LIB_DIR, '.pins.json');
+  await fsp.writeFile(pinPath, JSON.stringify(arr || []), 'utf8');
+}
+
+async function listLibrary() {
+  const pinIds = await readPinnedIds();
+  const files = await fsp.readdir(LIB_DIR);
+  const rows = [];
+  for (const f of files) {
+    if (f.startsWith('.')) continue;
+    const p = path.join(LIB_DIR, f);
+    const st = await fsp.stat(p);
+    if (!st.isFile()) continue;
+    rows.push({
+      id: f,
+      filename: f,
+      size: st.size,
+      pinned: pinIds.includes(f),
+      collection: '' // extension point
+    });
+  }
+  return rows;
+}
+
+// ===================================
+// Simple endpoints for library & chat
+// ===================================
+
+// List library files
+app.get('/api/library', async (req, res) => {
+  try { res.json(await listLibrary()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/library/pin', express.json(), (req, res) => {
-  const { id, pinned } = req.body || {};
-  const items = loadLib();
-  const idx = items.findIndex(x => x.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  items[idx].pinned = !!pinned;
-  saveLib(items);
-  res.json({ ok: true, item: items[idx] });
-});
-
-app.delete('/api/library/:id', async (req, res) => {
-  const { id } = req.params;
-  const items = loadLib();
-  const idx = items.findIndex(x => x.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  const item = items[idx];
+// Upload into library
+app.post('/api/library/upload', upload.array('files'), async (req, res) => {
   try {
-    const filePath = path.join(LIB_DIR, item.storedName);
-    if (fs.existsSync(filePath)) await fsp.unlink(filePath);
-  } catch (e) { console.warn('Could not delete file:', e.message); }
-  items.splice(idx, 1); saveLib(items);
-  res.json({ ok: true });
-});
-
-// ---------- chat files (per chat) ----------
-app.get('/api/chat/files', async (req, res) => {
-  try { res.json(await listChatFiles(req.query.chatId || 'default')); }
-  catch { res.status(500).json({ error: 'list failed' }); }
-});
-
-app.delete('/api/chat/files/:name', async (req, res) => {
-  try {
-    const chatId = req.query.chatId || 'default';
-    const fname = safeName(req.params.name || '');
-    const p = path.join(chatDir(chatId), fname);
-    if (!p.startsWith(chatDir(chatId))) return res.status(400).json({ error: 'bad path' });
-    if (fs.existsSync(p)) await fsp.unlink(p);
+    for (const f of req.files || []) {
+      const dest = path.join(LIB_DIR, safeName(f.originalname));
+      await fsp.rename(f.path, dest);
+    }
     res.json({ ok: true });
-  } catch { res.status(500).json({ error: 'delete failed' }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ---------- mock local ----------
-app.post('/api/process', uploadTemp.array('files'), async (req, res) => {
+// Pin/unpin
+app.post('/api/library/pin', async (req, res) => {
   try {
-    const { prompt = '', styleProfile = '', pinned = '[]', chatId = 'default' } = req.body;
-    const pinnedIds = JSON.parse(pinned || '[]');
-
-    let filesData = '';
-    for (const file of (req.files || [])) {
-      const content = await readFileSmart(file.path, file.originalname);
-      filesData += `\n\n--- FILE: ${file.originalname} ---\n${content.slice(0, 8000)}`;
-    }
-    const chatFiles = await listChatFiles(chatId);
-    for (const cf of chatFiles) {
-      const p = path.join(chatDir(chatId), cf.name);
-      const content = await readFileSmart(p, cf.name);
-      filesData += `\n\n--- CHAT: ${cf.name} ---\n${content.slice(0, 8000)}`;
-    }
-    const items = loadLib().filter(x => pinnedIds.includes(x.id) || x.pinned);
-    for (const it of items) {
-      const p = path.join(LIB_DIR, it.storedName);
-      const content = await readFileSmart(p, it.filename);
-      filesData += `\n\n--- LIBRARY: ${it.filename} ---\n${content.slice(0, 8000)}`;
-    }
-
-    if (req.files?.length) {
-      const dir = await ensureChatDir(chatId);
-      for (const f of req.files) {
-        await fsp.rename(f.path, path.join(dir, `${Date.now()}_${safeName(f.originalname)}`));
-      }
-    }
-
-    res.json({
-      response:
-        `Pretend AI says: "${prompt || '(no text)'}"\n\n` +
-        `StyleProfile: ${styleProfile ? '[provided]' : '[none]'}\n` +
-        `Attachments (new): ${(req.files || []).length} | Chat files: ${chatFiles.length} | Pinned: ${items.length}\n` +
-        `\n(Context length preview: ${filesData.length} chars)`
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      const { id, pinned } = body;
+      const current = await readPinnedIds();
+      const next = pinned ? Array.from(new Set([...current, id])) : current.filter(x => x !== id);
+      await writePinnedIds(next);
+      res.json({ ok: true, pinned: next });
     });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'process failed' }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ---------- non-stream (fallback) ----------
-app.post('/ask-ai', uploadTemp.array('files'), async (req, res) => {
-  const apiKey = process.env.OPENAI_API_KEY;
-  const useMock = !apiKey || apiKey === 'xxx';
+// Delete library file
+app.delete('/api/library/:id', async (req, res) => {
   try {
-    const { prompt = '', styleProfile = '', pinned = '[]', chatId = 'default' } = req.body;
-    const pinnedIds = JSON.parse(pinned || '[]');
+    const id = safeName(req.params.id);
+    await fsp.unlink(path.join(LIB_DIR, id));
+    const pins = await readPinnedIds();
+    await writePinnedIds(pins.filter(x => x !== id));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
-    let filesData = '';
-    for (const file of (req.files || [])) {
-      const content = await readFileSmart(file.path, file.originalname);
-      filesData += `\n\n--- FILE: ${file.originalname} ---\n${content.slice(0, 8000)}`;
-    }
-    const chatFiles = await listChatFiles(chatId);
-    for (const cf of chatFiles) {
-      const p = path.join(chatDir(chatId), cf.name);
-      const content = await readFileSmart(p, cf.name);
-      filesData += `\n\n--- CHAT: ${cf.name} ---\n${content.slice(0, 8000)}`;
-    }
-    const items = loadLib().filter(x => pinnedIds.includes(x.id) || x.pinned);
-    for (const it of items) {
-      const p = path.join(LIB_DIR, it.storedName);
-      const content = await readFileSmart(p, it.filename);
-      filesData += `\n\n--- LIBRARY: ${it.filename} ---\n${content.slice(0, 8000)}`;
+// List chat files
+app.get('/api/chat/files', async (req, res) => {
+  const { chatId } = req.query;
+  if (!chatId) return res.json([]);
+  const rows = await listChatFiles(chatId);
+  res.json(rows.map(r => ({ name: r.name, size: r.size })));
+});
+
+// Delete chat file
+app.delete('/api/chat/files/:name', async (req, res) => {
+  const { chatId } = req.query;
+  const name = req.params.name;
+  if (!chatId || !name) return res.status(400).json({ error: 'chatId and name required' });
+  try {
+    await fsp.unlink(path.join(CHAT_DIR, chatId, name));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =====================
+// Cost / token estimate
+// =====================
+app.post('/api/estimate', upload.array('files'), async (req, res) => {
+  try {
+    const { prompt = '', styleProfile = '' } = req.body || {};
+    let chars = prompt.length + styleProfile.length;
+
+    for (const f of req.files || []) {
+      // very rough: size → chars
+      chars += Math.min(400000, Math.max(1000, f.size)); // cap so it doesn't explode
+      fs.unlinkSync(f.path);
     }
 
-    if (req.files?.length) {
-      const dir = await ensureChatDir(chatId);
-      for (const f of req.files) {
-        await fsp.rename(f.path, path.join(dir, `${Date.now()}_${safeName(f.originalname)}`));
+    const tokens = tokensFromChars(chars);
+    const inputCostUSD = tokens * PER_TOKEN_USD;
+    res.json({ tokens, inputCostUSD });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ======================
+// Non-streaming fallback
+// ======================
+app.post('/ask-ai', upload.array('files'), async (req, res) => {
+  try {
+    assertApiKey();
+    const {
+      prompt = '',
+      chatId = 'default',
+      styleProfile = '',
+      retrieval = 'semantic',
+      ragK = '24',
+      ragBudget = '48000', // chars
+      srcUploads = '1',
+      srcChat = '1',
+      srcLibrary = '1',
+      mode = 'implement',
+      depth = 'normal',
+      maxTokens = '4096',
+      critique = '0'
+    } = req.body || {};
+
+    // Collect context
+    const context = await buildContext({
+      chatId,
+      uploaded: req.files || [],
+      takeUploads: srcUploads === '1',
+      takeChat: srcChat === '1',
+      takeLibrary: srcLibrary === '1',
+      ragBudget: Number(ragBudget)
+    });
+
+    // Compose prompt
+    const sys = systemPrompt({ mode, depth, critique });
+    const user = userPrompt({ prompt, styleProfile, context, retrieval, ragK: Number(ragK), maxTokens: Number(maxTokens) });
+
+    const r = await axios.post(`${OPENAI_BASE}/v1/chat/completions`, {
+      model: OPENAI_MODEL,
+      stream: false,
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: sys },
+        { role: 'user', content: user }
+      ],
+      max_tokens: Math.max(256, Math.min(8192, Number(maxTokens) || 4096))
+    }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } });
+
+    // Cleanup temps
+    for (const f of req.files || []) try { fs.unlinkSync(f.path); } catch {}
+
+    res.json({ aiResponse: r.data.choices?.[0]?.message?.content || '' });
+  } catch (e) {
+    console.error('ask-ai error', e.response?.data || e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================
+// Streaming endpoint
+// ==================
+app.post('/ask-ai/stream', upload.array('files'), async (resReq, resRes) => {
+  try {
+    assertApiKey();
+    // We’ll manage the response manually (SSE)
+    resRes.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no' // for some proxies
+    });
+
+    // Parse fields from multipart
+    const fields = {};
+    for (const [k, v] of Object.entries(resReq.body || {})) fields[k] = v;
+
+    const {
+      prompt = '',
+      chatId = 'default',
+      styleProfile = '',
+      retrieval = 'semantic',
+      ragK = '24',
+      ragBudget = '48000', // chars
+      srcUploads = '1',
+      srcChat = '1',
+      srcLibrary = '1',
+      mode = 'implement',
+      depth = 'normal',
+      maxTokens = '4096',
+      critique = '0'
+    } = fields;
+
+    // Build context (extract PDFs!)
+    const context = await buildContext({
+      chatId,
+      uploaded: resReq.files || [],
+      takeUploads: srcUploads === '1',
+      takeChat: srcChat === '1',
+      takeLibrary: srcLibrary === '1',
+      ragBudget: Number(ragBudget)
+    });
+
+    // Send the snapshot first so the UI dock can show what went in
+    resRes.write(`data: ${JSON.stringify({
+      meta: {
+        files: context.parts.map(p => ({ name: p.name, source: p.source, chars: p.text.length })),
+        tokens: tokensFromChars(context.concatText.length),
+        mode, depth,
+        retrievalStats: { k: Number(ragK), selected: context.parts.length, candidates: context.candidates }
       }
-    }
+    })}\n\n`);
 
-    const systemPrompt =
-`You are an AI coding assistant.
-Honor the user's coding style (JSON below) and prefer course materials in context.
+    const sys = systemPrompt({ mode, depth, critique });
+    const user = userPrompt({ prompt, styleProfile, context, retrieval, ragK: Number(ragK), maxTokens: Number(maxTokens) });
 
-STYLE PROFILE (JSON):
-${styleProfile || '(none provided)'}`;
-
-    const fullUser =
-`ASSIGNMENT / REQUEST:
-${prompt || '(no text)'}
-
-CONTEXT (Uploads this message + Chat files + Pinned Library):
-${filesData || '(none)'}
-`;
-
-    if (useMock) return res.json({ aiResponse: `🧪 MOCK RESPONSE\n\n${prompt}` });
-
-    // Non-stream fallback: Chat Completions is fine here.
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        response_format: { type: 'text' },
+    // Stream from OpenAI -> proxy as SSE
+    const r = await axios({
+      method: 'post',
+      url: `${OPENAI_BASE}/v1/chat/completions`,
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      responseType: 'stream',
+      data: {
+        model: OPENAI_MODEL,
+        stream: true,
         temperature: 0.2,
-        max_tokens: 2000,
         messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: fullUser }
-        ]
-      })
-    });
-    const data = await r.json();
-    res.json({ aiResponse: data?.choices?.[0]?.message?.content || '' });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'ask-ai failed' }); }
-});
-
-// ---------- STREAM (SSE) via Responses API “wire” ----------
-app.post('/ask-ai/stream', uploadTemp.array('files'), async (req, res) => {
-  const apiKey = process.env.OPENAI_API_KEY;
-  const useMock = !apiKey || apiKey === 'xxx';
-
-  // SSE headers
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders?.();
-
-  const write = (obj) => { if (!res.writableEnded) res.write(`data: ${typeof obj === 'string' ? obj : JSON.stringify(obj)}\n\n`); };
-  const ping  = () => { if (!res.writableEnded) res.write(':keep-alive\n\n'); }; // comment heartbeat
-  const end   = () => { if (!res.writableEnded) res.end(); };
-
-  let clientGone = false;
-  const abort = new AbortController();
-  req.on('close', () => { clientGone = true; abort.abort(); clear(); end(); });
-
-  const HEARTBEAT_MS = 15000;
-  const WATCHDOG_MS = 45000; // allow long “first token”
-  let hbTimer = setInterval(ping, HEARTBEAT_MS);
-  let watchdog = null;
-  const clear = () => { clearInterval(hbTimer); clearTimeout(watchdog); };
-
-  try {
-    const { prompt = '', styleProfile = '', pinned = '[]', chatId = 'default' } = req.body;
-    const pinnedIds = JSON.parse(pinned || '[]');
-
-    // Build context
-    let filesData = '';
-    for (const file of (req.files || [])) {
-      const content = await readFileSmart(file.path, file.originalname);
-      filesData += `\n\n--- FILE: ${file.originalname} ---\n${content.slice(0, 8000)}`;
-    }
-    const chatFiles = await listChatFiles(chatId);
-    for (const cf of chatFiles) {
-      const p = path.join(chatDir(chatId), cf.name);
-      const content = await readFileSmart(p, cf.name);
-      filesData += `\n\n--- CHAT: ${cf.name} ---\n${content.slice(0, 8000)}`;
-    }
-    const items = loadLib().filter(x => pinnedIds.includes(x.id) || x.pinned);
-    for (const it of items) {
-      const p = path.join(LIB_DIR, it.storedName);
-      const content = await readFileSmart(p, it.filename);
-      filesData += `\n\n--- LIBRARY: ${it.filename} ---\n${content.slice(0, 8000)}`;
-    }
-    if (req.files?.length) {
-      const dir = await ensureChatDir(chatId);
-      for (const f of req.files) {
-        await fsp.rename(f.path, path.join(dir, `${Date.now()}_${safeName(f.originalname)}`));
+          { role: 'system', content: sys },
+          { role: 'user', content: user }
+        ],
+        max_tokens: Math.max(256, Math.min(8192, Number(maxTokens) || 4096))
       }
-    }
-
-    const systemPrompt =
-`You are an AI coding assistant.
-Honor the user's coding style (JSON below) and prefer course materials in context.
-
-STYLE PROFILE (JSON):
-${styleProfile || '(none provided)'}`;
-
-    const fullUser =
-`ASSIGNMENT / REQUEST:
-${prompt || '(no text)'}
-
-CONTEXT (Uploads this message + Chat files + Pinned Library):
-${filesData || '(none)'}
-`;
-
-    if (useMock) {
-      const fake = `🧪 MOCK STREAM for: ${prompt}\n\n\`\`\`java\nSystem.out.println("hi");\n\`\`\``;
-      for (let i = 0; i < fake.length; i += 6) {
-        if (clientGone) break;
-        write({ delta: fake.slice(i, i + 6) });
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise(r => setTimeout(r, 25));
-      }
-      if (!clientGone) write('[DONE]');
-      clear(); return end();
-    }
-
-    // ---- Responses API wire stream ----
-    const r = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'gpt-4o',            // pick your model
-        stream: true,               // wire streaming
-        temperature: 0.2,
-        max_output_tokens: 2000,
-        instructions: systemPrompt, // system
-        input: fullUser             // user content
-      }),
-      signal: abort.signal
     });
 
-    if (!r.ok || !r.body) {
-      const text = await r.text().catch(() => '');
-      if (!clientGone) { write({ error: `OpenAI ${r.status}: ${text}` }); write('[DONE]'); }
-      clear(); return end();
-    }
-
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder('utf-8');
-    let buffer = '';
     let gotAny = false;
-
-    // watchdog fires only if nothing has streamed yet
-    watchdog = setTimeout(() => { if (!gotAny) abort.abort(); }, WATCHDOG_MS);
-
-    // Minimal event parser: blocks are separated by \n\n, each block may contain:
-    //   event: <name>
-    //   data: <json>
-    let currentEvent = null;
-
-    while (!clientGone) {
-      const { value, done } = await reader.read().catch(() => ({ done: true }));
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      let idx;
-      while ((idx = buffer.indexOf('\n\n')) !== -1) {
-        const raw = buffer.slice(0, idx).trim(); // one event block
-        buffer = buffer.slice(idx + 2);
-
-        if (!raw) continue;
-        const lines = raw.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('event:')) currentEvent = line.slice(6).trim();
-          else if (line.startsWith('data:')) {
-            const payload = line.slice(5).trim();
-            if (!payload) continue;
-            // Handle interesting events
-            if (currentEvent === 'response.output_text.delta') {
-              try {
-                const j = JSON.parse(payload);
-                const delta = j?.delta || '';
-                if (delta) {
-                  gotAny = true;
-                  write({ delta }); // forward to client
-                }
-              } catch {}
-            } else if (currentEvent === 'response.error') {
-              try {
-                const j = JSON.parse(payload);
-                write({ error: j?.error?.message || 'response.error' });
-              } catch { write({ error: 'response.error' }); }
-            } else if (currentEvent === 'response.completed') {
-              // graceful end — do nothing, we'll finish when stream ends
+    r.data.on('data', (chunk) => {
+      const str = chunk.toString('utf8');
+      // Relay OpenAI's SSE directly but also emit a JSON each delta for our UI
+      str.split('\n').forEach(line => {
+        if (!line.trim()) return;
+        if (line.startsWith('data:')) {
+          const payload = line.slice(5).trim();
+          if (payload === '[DONE]') {
+            resRes.write(`data: [DONE]\n\n`);
+            resRes.end();
+            return;
+          }
+          try {
+            const obj = JSON.parse(payload);
+            const delta = obj.choices?.[0]?.delta?.content || '';
+            if (delta) {
+              gotAny = true;
+              resRes.write(`data: ${JSON.stringify({ delta })}\n\n`);
             }
+          } catch {
+            // ignore keepalives
           }
         }
-        currentEvent = null; // reset for next block
-      }
-    }
+      });
+    });
 
-    clear();
-    if (!clientGone) { write('[DONE]'); end(); }
+    r.data.on('end', async () => {
+      if (!gotAny) {
+        // Fallback: do a one-shot completion and return its content
+        try {
+          const rr = await axios.post(`${OPENAI_BASE}/v1/chat/completions`, {
+            model: OPENAI_MODEL,
+            stream: false,
+            temperature: 0.2,
+            messages: [
+              { role: 'system', content: sys },
+              { role: 'user', content: user }
+            ],
+            max_tokens: Math.max(256, Math.min(8192, Number(maxTokens) || 4096))
+          }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } });
+          const content = rr.data.choices?.[0]?.message?.content || '';
+          resRes.write(`data: ${JSON.stringify({ delta: content })}\n\n`);
+        } catch (e) {
+          resRes.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+        }
+      }
+      resRes.write('data: [DONE]\n\n');
+      resRes.end();
+    });
+
+    r.data.on('error', (e) => {
+      resRes.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+      resRes.write('data: [DONE]\n\n');
+      resRes.end();
+    });
+
   } catch (e) {
-    const aborted = e?.name === 'AbortError' || /aborted/i.test(e?.message || '');
-    if (!aborted) { try { write({ error: e.message || 'stream failed' }); write('[DONE]'); } catch {} }
-    end();
+    console.error('stream error', e.message);
+    try {
+      resRes.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+      resRes.write('data: [DONE]\n\n');
+      resRes.end();
+    } catch {}
+  } finally {
+    // Cleanup temp upload files
+    for (const f of (resReq.files || [])) try { fs.unlinkSync(f.path); } catch {}
   }
 });
 
-// ---------- cost estimate ----------
-app.post('/api/estimate', uploadTemp.array('files'), async (req, res) => {
-  try {
-    const { prompt = '', styleProfile = '', pinned = '[]', chatId = 'default' } = req.body;
-    const pinnedIds = JSON.parse(pinned || '[]');
-
-    let chars = prompt.length + styleProfile.length;
-    for (const f of (req.files || [])) {
-      const content = await readFileSmart(f.path, f.originalname);
-      chars += content.length;
-    }
-    const chatFiles = await listChatFiles(chatId);
-    for (const cf of chatFiles) {
-      const p = path.join(chatDir(chatId), cf.name);
-      const content = await readFileSmart(p, cf.name);
-      chars += content.length;
-    }
-    const items = loadLib().filter(x => pinnedIds.includes(x.id) || x.pinned);
-    for (const it of items) {
-      const p = path.join(LIB_DIR, it.storedName);
-      const content = await readFileSmart(p, it.filename);
-      chars += content.length;
-    }
-    for (const f of (req.files || [])) { try { await fsp.unlink(f.path); } catch {} }
-
-    const tokens = Math.ceil(chars / 4);
-    const inputCost = (tokens / 1_000_000) * 5; // ≈$5/million input tokens (tweak to your model)
-    res.json({ tokens, inputCostUSD: Number(inputCost.toFixed(4)) });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'estimate failed' }); }
+// =====================
+// Mock endpoint (local)
+// =====================
+app.post('/api/process', upload.array('files'), async (req, res) => {
+  const prompt = req.body.prompt || '';
+  const files = req.files || [];
+  // Echo mock
+  for (const f of files) try { fs.unlinkSync(f.path); } catch {}
+  res.json({ response: `Pretend AI says: "${prompt}" with ${files.length} file(s) uploaded.` });
 });
 
-// ---------- start ----------
+// =====================
+// Context helpers
+// =====================
+async function buildContext({ chatId, uploaded, takeUploads, takeChat, takeLibrary, ragBudget }) {
+  const parts = [];
+  let candidates = 0;
+
+  // 1) New uploads: persist to chat folder, extract text
+  if (takeUploads && uploaded?.length) {
+    const chatPath = path.join(CHAT_DIR, chatId);
+    await ensureDir(chatPath);
+    for (const f of uploaded) {
+      const dest = path.join(chatPath, safeName(f.originalname));
+      try { await fsp.copyFile(f.path, dest); } catch {}
+      const text = await extractText(f.path, f.originalname, f.mimetype);
+      if (text?.trim()) parts.push({ source: 'upload', name: f.originalname, text });
+    }
+  }
+
+  // 2) Chat files (persisted)
+  if (takeChat) {
+    const rows = await listChatFiles(chatId);
+    for (const r of rows) {
+      const text = await extractText(r.path, r.name, '');
+      candidates++;
+      if (text?.trim()) parts.push({ source: 'chat', name: r.name, text });
+    }
+  }
+
+  // 3) Pinned library
+  if (takeLibrary) {
+    const pinIds = await readPinnedIds();
+    for (const id of pinIds) {
+      const p = path.join(LIB_DIR, id);
+      if (!fs.existsSync(p)) continue;
+      const text = await extractText(p, id, '');
+      candidates++;
+      if (text?.trim()) parts.push({ source: 'lib', name: id, text });
+    }
+  }
+
+  // Budgeting: keep the most recent/uploads first, then trim by char budget
+  let remaining = Math.max(2000, ragBudget || 48000); // chars
+  const selected = [];
+  for (const part of parts) {
+    if (remaining <= 0) break;
+    const take = truncateByBudget(part.text, remaining);
+    selected.push({ ...part, text: take });
+    remaining -= take.length;
+  }
+
+  const concatText = selected.map(p => `--- ${p.source.toUpperCase()}: ${p.name} ---\n${p.text}`).join('\n\n');
+
+  return {
+    parts: selected,
+    concatText,
+    candidates
+  };
+}
+
+function systemPrompt({ mode, depth, critique }) {
+  return [
+    `You are MyCoder, a coding assistant.`,
+    `You ALWAYS use the provided CONTEXT when it exists.`,
+    `Never say "I can't open PDFs" — the relevant text has already been extracted for you.`,
+    `Cite filenames when you rely on specific parts.`,
+    `Mode=${mode}, Depth=${depth}, Critique=${critique === '1' ? 'on' : 'off'}.`,
+    `Be explicit, produce complete, compilable code, and explain the plan first when appropriate.`
+  ].join(' ');
+}
+
+function userPrompt({ prompt, styleProfile, context, retrieval, ragK, maxTokens }) {
+  const style = styleProfile ? `\n\n[STYLE PROFILE]\n${styleProfile}\n` : '';
+  const ctx = context?.concatText ? `\n\n[CONTEXT]\n${context.concatText}\n` : '';
+  const guide = `\n\n[GUIDANCE]\nRetrieval=${retrieval}, k=${ragK}, maxTokens=${maxTokens}. Use the style profile. Prefer the class/lib APIs shown in context.`;
+  return `${prompt}${style}${ctx}${guide}`;
+}
+
+// ----------------
+// Start Server
+// ----------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 

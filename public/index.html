@@ -1,135 +1,227 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>MyCoder AI</title>
-  <link rel="stylesheet" href="styles.css"/>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MyCoder</title>
+
+  <!-- Prism (syntax highlighting) -->
+  <link rel="stylesheet" href="https://unpkg.com/prismjs@1.29.0/themes/prism-tomorrow.css">
+  <script defer src="https://unpkg.com/prismjs@1.29.0/prism.js"></script>
+  <script defer src="https://unpkg.com/prismjs@1.29.0/components/prism-java.min.js"></script>
+  <script defer src="https://unpkg.com/prismjs@1.29.0/components/prism-python.min.js"></script>
+  <script defer src="https://unpkg.com/prismjs@1.29.0/components/prism-c.min.js"></script>
+  <script defer src="https://unpkg.com/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+  <script defer src="https://unpkg.com/prismjs@1.29.0/components/prism-javascript.min.js"></script>
+  <script defer src="https://unpkg.com/prismjs@1.29.0/plugins/toolbar/prism-toolbar.min.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/prismjs@1.29.0/plugins/toolbar/prism-toolbar.css">
+  <script defer src="https://unpkg.com/prismjs@1.29.0/plugins/copy-to-clipboard/prism-copy-to-clipboard.min.js"></script>
+
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <!-- LEFT: Sidebar -->
   <aside class="sidebar">
-    <div class="brand">🧠 MyCoder</div>
-    <button id="newChatBtn" class="btn primary">+ New chat</button>
-
-    <div class="history-title">History</div>
+    <div class="brand">MyCoder</div>
+    <div class="history-title">Chats</div>
     <div id="history" class="history"></div>
 
-    <div class="spacer"></div>
-
     <div class="foot">
-      <button id="chatFilesBtn" class="btn ghost">📎 Chat files</button>
-      <button id="libraryBtn" class="btn ghost">📚 Library</button>
-      <button id="darkToggle" class="btn ghost">🌗 Dark</button>
+      <button id="newChatBtn" class="btn primary">New chat</button>
+      <button id="settingsBtn" class="btn">Settings</button>
     </div>
 
     <div class="danger-zone">
-      <button id="deleteAllBtn" class="btn danger">Delete all chats</button>
+      <div class="history-title">Danger Zone</div>
+      <button id="deleteAllBtn" class="btn danger">Delete All Chats</button>
     </div>
   </aside>
 
+  <!-- CENTER: Chat -->
   <main class="main">
-    <header class="topbar">
-      <div class="model">Model: <span id="modelName">Local (mock)</span></div>
-      <div class="actions" style="gap:.5rem; display:flex; align-items:center;">
+    <div class="topbar">
+      <div class="model" id="modelName">GPT</div>
+      <div class="badges">
+        <span id="costBadge" class="badge">Est: C$0.0000 • ~0 tok</span>
         <span id="chatBadge" class="badge">Chat: C$0.0000 • 0 tok</span>
         <span id="totalBadge" class="badge ghost">All: C$0.0000 • 0 tok</span>
-        <span id="costBadge" class="badge">Est: C$0.0000 • ~0 tok</span>
-        <button id="settingsBtn" class="icon-btn" title="Settings">⚙️</button>
       </div>
-    </header>
+    </div>
 
     <section id="chat" class="chat"></section>
 
-    <footer class="composer">
-      <div class="dropzone">
-        <input id="fileInput" type="file" multiple hidden/>
-        <button id="chooseFiles" class="btn" type="button">Attach (this message)</button>
-        <div id="filePills" class="file-pills"></div>
-      </div>
-      <div class="input-row">
-        <textarea id="prompt" rows="1" placeholder="Ask anything about your assignment, starter code, or slides..."></textarea>
-        <div class="send-row">
-          <button id="stopBtn" class="btn danger" type="button" style="display:none;">Stop</button>
-          <button id="sendBtn" class="btn primary" type="button">Send</button>
+    <section class="composer">
+      <div class="mode-row">
+        <div class="modes">
+          <button class="chip active" data-mode="implement">Implement</button>
+          <button class="chip" data-mode="plan">Plan</button>
+          <button class="chip" data-mode="refactor">Refactor</button>
+          <button class="chip" data-mode="document">Document</button>
+          <button class="chip" data-mode="test">Test</button>
+        </div>
+        <div class="knobs">
+          <label class="knob">
+            Depth
+            <select id="depthSel">
+              <option value="normal" selected>Normal</option>
+              <option value="thorough">Thorough</option>
+              <option value="concise">Concise</option>
+            </select>
+          </label>
+          <label class="knob">
+            Max tokens
+            <input id="maxTok" type="number" min="256" max="8192" step="256" value="4096" />
+          </label>
+          <label class="knob">
+            Critique pass
+            <input id="critique" type="checkbox" />
+          </label>
         </div>
       </div>
-      <div class="hint">Tip: drag & drop files anywhere. <strong>Chat files</strong> persist for this chat. <strong>Library</strong> files are global (pin to auto-include).</div>
-    </footer>
+
+      <!-- Retrieval controls -->
+      <div class="mode-row">
+        <div class="modes">
+          <span class="label">Retrieval</span>
+          <button class="chip active" data-retrieval="semantic">Smart (RAG)</button>
+          <button class="chip" data-retrieval="all">All content</button>
+        </div>
+        <div class="knobs">
+          <label class="knob">
+            Top-K
+            <input id="ragK" type="number" min="4" max="64" step="2" value="24" />
+          </label>
+          <label class="knob">
+            Context budget (tok)
+            <input id="ragBudget" type="number" min="2000" max="60000" step="1000" value="12000" />
+          </label>
+          <label class="knob">
+            Sources
+            <span class="srcs">
+              <label><input type="checkbox" id="srcUploads" checked /> Attachments</label>
+              <label><input type="checkbox" id="srcChat" checked /> Chat files</label>
+              <label><input type="checkbox" id="srcLibrary" checked /> Pinned library</label>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <div class="dropzone">
+        <button id="chooseFiles" class="btn">+ Add files</button>
+        <input id="fileInput" type="file" multiple hidden />
+        <div id="filePills" class="file-pills"></div>
+      </div>
+
+      <div class="input-row">
+        <textarea id="prompt" placeholder="Describe your assignment or change request..."></textarea>
+        <div class="send-row">
+          <button id="sendBtn" class="btn primary">Send</button>
+          <button id="stopBtn" style="display:none" class="btn">Stop</button>
+        </div>
+      </div>
+    </section>
   </main>
 
-  <!-- Settings Modal -->
-  <dialog id="settingsModal">
-    <form method="dialog" class="modal">
-      <h3>Settings</h3>
+  <!-- RIGHT: Context Dock -->
+  <aside class="dock">
+    <div class="dock-head">
+      <div>Context</div>
+      <div class="dock-actions">
+        <button id="chatFilesBtn" class="btn">Chat files</button>
+        <button id="libraryBtn" class="btn">Library</button>
+      </div>
+    </div>
 
+    <div class="dock-section">
+      <div class="dock-title">Style Profile</div>
+      <label class="switch">
+        <input id="styleToggle" type="checkbox" checked />
+        <span>include</span>
+      </label>
+      <textarea id="styleProfile" class="style-box" placeholder='Paste your style JSON here...'></textarea>
+    </div>
+
+    <div class="dock-section">
+      <div class="dock-title">This Message</div>
+      <div id="dockMessageFiles" class="dock-list empty">No files attached</div>
+    </div>
+
+    <div class="dock-section">
+      <div class="dock-title">Chat Files (persistent)</div>
+      <div id="dockChatFiles" class="dock-list empty">None yet</div>
+    </div>
+
+    <div class="dock-section">
+      <div class="dock-title">Pinned Library</div>
+      <div id="dockLibrary" class="dock-list empty">None pinned</div>
+    </div>
+
+    <div class="dock-section">
+      <div class="dock-title">Actually Sent (last turn)</div>
+      <div id="dockSent" class="dock-list empty">—</div>
+    </div>
+  </aside>
+
+  <!-- Settings Modal -->
+  <dialog id="settingsModal" class="modal large">
+    <h3>Settings</h3>
+    <div class="row2">
       <label class="lbl">Endpoint
         <select id="endpoint">
-          <option value="/api/process">/api/process (mock/local)</option>
-          <option value="/ask-ai">/ask-ai (OpenAI, streaming)</option>
+          <option value="/ask-ai" selected>Real (OpenAI, streaming)</option>
+          <option value="/api/process">Local mock</option>
         </select>
-      </label>
-
-      <label class="lbl">Style Profile JSON
-        <textarea id="styleProfile" rows="6" placeholder='{"naming":{"variables":"camelCase"},"braces":"K&R"}'></textarea>
       </label>
 
       <label class="lbl">Currency
         <select id="currency">
-          <option value="USD">USD</option>
           <option value="CAD" selected>CAD</option>
+          <option value="USD">USD</option>
         </select>
       </label>
 
-      <label class="lbl">FX Rate (1 USD = ?)
-        <input id="fxRate" type="number" min="0" step="0.0001" placeholder="e.g. 1.35"/>
+      <label class="lbl">FX rate (USD→CAD)
+        <input id="fxRate" type="number" step="0.01" value="1.35" />
       </label>
 
-      <label class="lbl">Monthly Budget Cap (in selected currency)
-        <input id="budgetCap" type="number" min="0" step="0.01" placeholder="e.g. 20.00"/>
+      <label class="lbl">Budget cap (chat)
+        <input id="budgetCap" type="number" step="0.01" placeholder="0 = none" />
       </label>
 
-      <menu>
-        <button id="closeSettings" class="btn" type="button">Close</button>
-        <button id="saveSettings" class="btn primary" type="button">Save</button>
-      </menu>
-    </form>
+      <label class="lbl">
+        Dark mode
+        <input id="darkToggle" type="checkbox" />
+      </label>
+    </div>
+
+    <div class="actions">
+      <button id="saveSettings" class="btn primary">Save</button>
+      <button id="closeSettings" class="btn">Close</button>
+    </div>
   </dialog>
 
   <!-- Library Modal -->
-  <dialog id="libraryModal">
-    <form method="dialog" class="modal large">
-      <h3>Library (global, persistent)</h3>
-
-      <div class="lib-actions">
-        <input id="libFiles" type="file" multiple/>
-        <input id="libCollection" placeholder="collection (optional)" />
-        <button id="libUploadBtn" class="btn" type="button">Upload</button>
-        <span class="muted">Upload slides, starters, past projects once. Pin to always include in every message.</span>
-      </div>
-
-      <div id="libList" class="lib-list"></div>
-
-      <menu>
-        <button id="closeLibrary" class="btn" type="button">Close</button>
-      </menu>
-    </form>
+  <dialog id="libraryModal" class="modal large">
+    <h3>Library</h3>
+    <div class="lib-actions">
+      <input id="libFiles" type="file" multiple />
+      <input id="libCollection" placeholder="collection (optional)" />
+      <button id="libUploadBtn" class="btn">Upload</button>
+    </div>
+    <div id="libList" class="lib-list"></div>
+    <div class="actions">
+      <button id="closeLibrary" class="btn">Close</button>
+    </div>
   </dialog>
 
   <!-- Chat Files Modal -->
-  <dialog id="chatFilesModal">
-    <form method="dialog" class="modal large">
-      <h3>Chat files (persist only in this chat)</h3>
-
-      <div class="muted">Files you attach while sending are automatically saved here and used on future prompts in this chat.</div>
-      <div id="chatFilesList" class="lib-list"></div>
-
-      <menu>
-        <button id="closeChatFiles" class="btn" type="button">Close</button>
-      </menu>
-    </form>
+  <dialog id="chatFilesModal" class="modal">
+    <h3>Chat files</h3>
+    <div id="chatFilesList" class="lib-list"></div>
+    <div class="actions"><button id="closeChatFiles" class="btn">Close</button></div>
   </dialog>
 
-  <script src="app.js"></script>
+  <script defer src="/app.js"></script>
 </body>
 </html>
 

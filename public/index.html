@@ -17,6 +17,7 @@
     <div class="spacer"></div>
 
     <div class="foot">
+      <button id="chatFilesBtn" class="btn ghost">📎 Chat files</button>
       <button id="libraryBtn" class="btn ghost">📚 Library</button>
       <button id="darkToggle" class="btn ghost">🌗 Dark</button>
     </div>
@@ -29,8 +30,10 @@
   <main class="main">
     <header class="topbar">
       <div class="model">Model: <span id="modelName">Local (mock)</span></div>
-      <div class="actions">
-        <span id="costBadge" class="badge">~0 tok • $0.0000</span>
+      <div class="actions" style="gap:.5rem; display:flex; align-items:center;">
+        <span id="chatBadge" class="badge">Chat: C$0.0000 • 0 tok</span>
+        <span id="totalBadge" class="badge ghost">All: C$0.0000 • 0 tok</span>
+        <span id="costBadge" class="badge">Est: C$0.0000 • ~0 tok</span>
         <button id="settingsBtn" class="icon-btn" title="Settings">⚙️</button>
       </div>
     </header>
@@ -40,14 +43,17 @@
     <footer class="composer">
       <div class="dropzone">
         <input id="fileInput" type="file" multiple hidden/>
-        <button id="chooseFiles" class="btn" type="button">📎 Attach</button>
+        <button id="chooseFiles" class="btn" type="button">Attach (this message)</button>
         <div id="filePills" class="file-pills"></div>
       </div>
       <div class="input-row">
         <textarea id="prompt" rows="1" placeholder="Ask anything about your assignment, starter code, or slides..."></textarea>
-        <button id="sendBtn" class="btn primary" type="button">Send</button>
+        <div class="send-row">
+          <button id="stopBtn" class="btn danger" type="button" style="display:none;">Stop</button>
+          <button id="sendBtn" class="btn primary" type="button">Send</button>
+        </div>
       </div>
-      <div class="hint">Tip: drag & drop files anywhere in the window. Pinned library files are always included.</div>
+      <div class="hint">Tip: drag & drop files anywhere. <strong>Chat files</strong> persist for this chat. <strong>Library</strong> files are global (pin to auto-include).</div>
     </footer>
   </main>
 
@@ -59,7 +65,7 @@
       <label class="lbl">Endpoint
         <select id="endpoint">
           <option value="/api/process">/api/process (mock/local)</option>
-          <option value="/ask-ai">/ask-ai (OpenAI)</option>
+          <option value="/ask-ai">/ask-ai (OpenAI, streaming)</option>
         </select>
       </label>
 
@@ -67,7 +73,18 @@
         <textarea id="styleProfile" rows="6" placeholder='{"naming":{"variables":"camelCase"},"braces":"K&R"}'></textarea>
       </label>
 
-      <label class="lbl">Monthly Budget Cap (USD)
+      <label class="lbl">Currency
+        <select id="currency">
+          <option value="USD">USD</option>
+          <option value="CAD" selected>CAD</option>
+        </select>
+      </label>
+
+      <label class="lbl">FX Rate (1 USD = ?)
+        <input id="fxRate" type="number" min="0" step="0.0001" placeholder="e.g. 1.35"/>
+      </label>
+
+      <label class="lbl">Monthly Budget Cap (in selected currency)
         <input id="budgetCap" type="number" min="0" step="0.01" placeholder="e.g. 20.00"/>
       </label>
 
@@ -81,19 +98,33 @@
   <!-- Library Modal -->
   <dialog id="libraryModal">
     <form method="dialog" class="modal large">
-      <h3>Library (persistent uploads)</h3>
+      <h3>Library (global, persistent)</h3>
 
       <div class="lib-actions">
         <input id="libFiles" type="file" multiple/>
         <input id="libCollection" placeholder="collection (optional)" />
         <button id="libUploadBtn" class="btn" type="button">Upload</button>
-        <span class="muted">Upload slides, starters, past projects here once. Pin to always include.</span>
+        <span class="muted">Upload slides, starters, past projects once. Pin to always include in every message.</span>
       </div>
 
       <div id="libList" class="lib-list"></div>
 
       <menu>
         <button id="closeLibrary" class="btn" type="button">Close</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Chat Files Modal -->
+  <dialog id="chatFilesModal">
+    <form method="dialog" class="modal large">
+      <h3>Chat files (persist only in this chat)</h3>
+
+      <div class="muted">Files you attach while sending are automatically saved here and used on future prompts in this chat.</div>
+      <div id="chatFilesList" class="lib-list"></div>
+
+      <menu>
+        <button id="closeChatFiles" class="btn" type="button">Close</button>
       </menu>
     </form>
   </dialog>

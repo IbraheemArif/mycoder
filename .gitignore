@@ -1,9 +1,6 @@
-# Ignore API keys and secrets
 .env
-
-# Ignore installed dependencies
-node_modules/
-
-# Ignore temporary uploads
 uploads/
-
+data/
+node_modules/
+.DS_Store
+*.log

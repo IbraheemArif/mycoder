@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MyCoder AI</title>
+  <link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">🧠 MyCoder</div>
+    <button id="newChatBtn" class="btn primary">+ New chat</button>
+
+    <div class="history-title">History</div>
+    <div id="history" class="history"></div>
+
+    <div class="spacer"></div>
+
+    <div class="foot">
+      <button id="libraryBtn" class="btn ghost">📚 Library</button>
+      <button id="darkToggle" class="btn ghost">🌗 Dark</button>
+    </div>
+
+    <div class="danger-zone">
+      <button id="deleteAllBtn" class="btn danger">Delete all chats</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="model">Model: <span id="modelName">Local (mock)</span></div>
+      <div class="actions">
+        <span id="costBadge" class="badge">~0 tok • $0.0000</span>
+        <button id="settingsBtn" class="icon-btn" title="Settings">⚙️</button>
+      </div>
+    </header>
+
+    <section id="chat" class="chat"></section>
+
+    <footer class="composer">
+      <div class="dropzone">
+        <input id="fileInput" type="file" multiple hidden/>
+        <button id="chooseFiles" class="btn" type="button">📎 Attach</button>
+        <div id="filePills" class="file-pills"></div>
+      </div>
+      <div class="input-row">
+        <textarea id="prompt" rows="1" placeholder="Ask anything about your assignment, starter code, or slides..."></textarea>
+        <button id="sendBtn" class="btn primary" type="button">Send</button>
+      </div>
+      <div class="hint">Tip: drag & drop files anywhere in the window. Pinned library files are always included.</div>
+    </footer>
+  </main>
+
+  <!-- Settings Modal -->
+  <dialog id="settingsModal">
+    <form method="dialog" class="modal">
+      <h3>Settings</h3>
+
+      <label class="lbl">Endpoint
+        <select id="endpoint">
+          <option value="/api/process">/api/process (mock/local)</option>
+          <option value="/ask-ai">/ask-ai (OpenAI)</option>
+        </select>
+      </label>
+
+      <label class="lbl">Style Profile JSON
+        <textarea id="styleProfile" rows="6" placeholder='{"naming":{"variables":"camelCase"},"braces":"K&R"}'></textarea>
+      </label>
+
+      <label class="lbl">Monthly Budget Cap (USD)
+        <input id="budgetCap" type="number" min="0" step="0.01" placeholder="e.g. 20.00"/>
+      </label>
+
+      <menu>
+        <button id="closeSettings" class="btn" type="button">Close</button>
+        <button id="saveSettings" class="btn primary" type="button">Save</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Library Modal -->
+  <dialog id="libraryModal">
+    <form method="dialog" class="modal large">
+      <h3>Library (persistent uploads)</h3>
+
+      <div class="lib-actions">
+        <input id="libFiles" type="file" multiple/>
+        <input id="libCollection" placeholder="collection (optional)" />
+        <button id="libUploadBtn" class="btn" type="button">Upload</button>
+        <span class="muted">Upload slides, starters, past projects here once. Pin to always include.</span>
+      </div>
+
+      <div id="libList" class="lib-list"></div>
+
+      <menu>
+        <button id="closeLibrary" class="btn" type="button">Close</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
+

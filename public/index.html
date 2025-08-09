@@ -47,7 +47,7 @@
   <!-- CENTER: Chat -->
   <main class="main">
     <div class="topbar">
-      <div class="model" id="modelName">GPT</div>
+      <div class="model" id="modelName">Local (mock)</div>
       <div class="badges">
         <span id="costBadge" class="badge">Est: C$0.0000 • ~0 tok</span>
         <span id="chatBadge" class="badge">Chat: C$0.0000 • 0 tok</span>
@@ -175,8 +175,8 @@
     <div class="row2">
       <label class="lbl">Endpoint
         <select id="endpoint">
-          <option value="/ask-ai" selected>Real (OpenAI, streaming)</option>
-          <option value="/api/process">Local mock</option>
+          <option value="/api/process" selected>Local mock (default public)</option>
+          <option value="/ask-ai">Real (OpenAI, streaming)</option>
         </select>
       </label>
 
@@ -225,10 +225,23 @@
   <dialog id="chatFilesModal" class="modal">
     <h3>Chat files</h3>
     <div id="chatFilesList" class="lib-list"></div>
-    <div class="actions"><button id="closeChatFiles" class="btn">Close</button></div>
+    <div class="actions">
+      <button id="closeChatFiles" class="btn">Close</button>
+    </div>
   </dialog>
 
-  <script defer src="/app.js"></script>
+  <!-- Access Key Modal (only when switching to real) -->
+  <dialog id="loginModal" class="modal">
+    <h3>Enter access key</h3>
+    <p class="muted">This is only required when using the real OpenAI API.</p>
+    <input id="loginKey" type="password" placeholder="Access key" />
+    <div class="actions" style="margin-top:10px">
+      <button id="loginSubmit" class="btn primary">Unlock</button>
+    </div>
+    <div id="loginErr" class="muted" style="color:#e11d48;margin-top:6px;display:none">Invalid key</div>
+  </dialog>
+
+  <script src="/app.js"></script>
 </body>
 </html>
 

@@ -2,18 +2,20 @@
 
 // Tiny helpers to avoid crashes if an element is missing.
 function $(id){ return document.getElementById(id); }
-function bind(el, evt, fn){ if(el) el.addEventListener(evt, fn); else console.warn(`[UI] Missing element for ${evt}:`, fn.name || '(anon)'); }
+function bind(el, evt, fn){ if(el) el.addEventListener(evt, fn); }
 function txt(el, s){ if(el) el.textContent = s; }
 function html(el, s){ if(el) el.innerHTML = s; }
 
 window.addEventListener('error', (e) => {
   console.error('[App] Uncaught error:', e.message, 'at', e.filename, e.lineno+':'+e.colno);
 });
+
 window.addEventListener('DOMContentLoaded', () => {
   console.log('[App] Booting UI…');
 
   // ---- State ----
-  let API_ENDPOINT = localStorage.getItem('endpoint') || '/ask-ai';
+  // Default to mock (public)
+  let API_ENDPOINT = localStorage.getItem('endpoint') || '/api/process';
   let STYLE_PROFILE = localStorage.getItem('styleProfile') || '';
   let DARK = localStorage.getItem('dark') === '1';
 
@@ -23,6 +25,9 @@ window.addEventListener('DOMContentLoaded', () => {
 
   let SPEND_USD_GLOBAL = parseFloat(localStorage.getItem('spendAllUsd') || '0') || 0;
   let TOKENS_GLOBAL = parseInt(localStorage.getItem('tokensAll') || '0', 10) || 0;
+
+  // Access key (only needed for real endpoint)
+  let ACCESS_KEY = localStorage.getItem('mc_key') || '';
 
   // ---- DOM ----
   const chatEl = $('chat');
@@ -77,20 +82,20 @@ window.addEventListener('DOMContentLoaded', () => {
   const srcChat = $('srcChat');
   const srcLibrary = $('srcLibrary');
 
-  // quick sanity log
-  console.log('[App] Elements wired:', {
-    chatEl: !!chatEl, settingsBtn: !!settingsBtn, settingsModal: !!settingsModal,
-    libraryBtn: !!libraryBtn, libraryModal: !!libraryModal, deleteAllBtn: !!deleteAllBtn
-  });
+  const loginModal = $('loginModal');
+  const loginKey = $('loginKey');
+  const loginSubmit = $('loginSubmit');
+  const loginErr = $('loginErr');
 
   // ---- Local state ----
   let attachedFiles = [];
   let conversation = loadOrNewConversation();
-  let includeStyle = true;
+  let includeStyle = true; // << SINGLE declaration lives here
   let currentAbort = null;
   let libMap = {};
   let chatFilesCache = [];
 
+  // ---- Utils ----
   const curSymbol = () => (CURRENCY === 'CAD' ? 'C$' : 'US$');
   const toLocal = (usd) => (CURRENCY === 'CAD' ? usd * FX_RATE : usd);
   const fmtMoney = (n) => (n || 0).toFixed(4);
@@ -154,6 +159,17 @@ window.addEventListener('DOMContentLoaded', () => {
       actions.appendChild(del); row.appendChild(title); row.appendChild(actions); historyEl.appendChild(row);
     }
   }
+  bind(deleteAllBtn, 'click', () => {
+    if (!confirm('Delete ALL chats and totals?')) return;
+    const all = JSON.parse(localStorage.getItem('history') || '[]');
+    for (const c of all) localStorage.removeItem(`conv:${c.id}`);
+    localStorage.removeItem('history');
+    localStorage.removeItem('activeConvId');
+    localStorage.removeItem('spendAllUsd');
+    localStorage.removeItem('tokensAll');
+    newChat();
+  });
+
   function deleteConversation(id){
     const wasActive = conversation.id === id;
     localStorage.removeItem(`conv:${id}`);
@@ -199,11 +215,22 @@ window.addEventListener('DOMContentLoaded', () => {
 
   bind(settingsBtn, 'click', () => settingsModal?.showModal());
   bind($('closeSettings'), 'click', () => settingsModal?.close());
-  bind($('saveSettings'), 'click', () => {
+  bind($('saveSettings'), 'click', async () => {
     if (endpointSel) API_ENDPOINT = endpointSel.value;
     if (currencySel) CURRENCY = currencySel.value;
     if (fxRateEl) FX_RATE = parseFloat(fxRateEl.value || '1') || 1.0;
     if (budgetInput) BUDGET_CAP = parseFloat(budgetInput.value || '0') || 0;
+
+    // If switching to real endpoint, ask for access key if not set
+    if (API_ENDPOINT === '/ask-ai' && !ACCESS_KEY) {
+      const ok = await ensureAccessKeyInteractive();
+      if (!ok) {
+        alert('Failed to unlock real API. Staying on Local mock.');
+        API_ENDPOINT = '/api/process';
+        endpointSel.value = API_ENDPOINT;
+      }
+    }
+
     localStorage.setItem('endpoint', API_ENDPOINT);
     localStorage.setItem('currency', CURRENCY);
     localStorage.setItem('fxRate', String(FX_RATE));
@@ -387,6 +414,43 @@ window.addEventListener('DOMContentLoaded', () => {
   function updateGlobalTotalsFromStorage(){ const all=JSON.parse(localStorage.getItem('history')||'[]'); let usd=0,tok=0; for(const c of all){ const raw=localStorage.getItem(`conv:${c.id}`); if(!raw) continue; const conv=JSON.parse(raw); if(conv?.totals){ usd+=+conv.totals.inputUSD||0; tok+=+conv.totals.inputTokens||0; } } SPEND_USD_GLOBAL=usd; TOKENS_GLOBAL=tok; localStorage.setItem('spendAllUsd',String(usd)); localStorage.setItem('tokensAll',String(tok)); }
   function updateSpendBadges(){ updateGlobalTotalsFromStorage(); const cu=+(conversation?.totals?.inputUSD||0), ct=+(conversation?.totals?.inputTokens||0); if (chatBadge) txt(chatBadge, `Chat: ${curSymbol()}${fmtMoney(toLocal(cu))} • ${ct} tok`); if (totalBadge) txt(totalBadge, `All: ${curSymbol()}${fmtMoney(toLocal(SPEND_USD_GLOBAL))} • ${TOKENS_GLOBAL} tok`); if (modelName) txt(modelName, API_ENDPOINT === '/ask-ai' ? 'GPT (real, streaming)' : 'Local (mock)'); }
 
+  // ---- Access key flow (only for real endpoint) ----
+  function withKeyHeaders(init = {}) {
+    const h = new Headers(init.headers || {});
+    if (ACCESS_KEY) h.set('x-mycoder-key', ACCESS_KEY);
+    return { ...init, headers: h };
+  }
+
+  async function ensureAccessKeyInteractive() {
+    if (ACCESS_KEY) return true;
+    if (!loginModal) return false;
+
+    loginErr.style.display = 'none';
+    loginModal.showModal();
+
+    return new Promise((resolve) => {
+      async function handler() {
+        const k = (loginKey.value || '').trim();
+        try {
+          const r = await fetch('/auth/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: k })
+          });
+          if (!r.ok) throw new Error('bad');
+          ACCESS_KEY = k;
+          localStorage.setItem('mc_key', k);
+          loginModal.close();
+          loginSubmit.removeEventListener('click', handler);
+          resolve(true);
+        } catch {
+          loginErr.style.display = 'block';
+        }
+      }
+      loginSubmit.addEventListener('click', handler);
+    });
+  }
+
   // ---- Send ----
   async function send(){
     const text = (promptEl?.value||'').trim();
@@ -431,7 +495,16 @@ window.addEventListener('DOMContentLoaded', () => {
 
     const meta = { included:{ profile:!!(includeStyle && STYLE_PROFILE), uploads:attachedFiles.map(f=>f.name), chatFiles:chatFilesCache.map(f=>f.name), pinned:pinnedIds.map(id=>libMap[id]).filter(Boolean) }, est:{ inputTokens:estTok, inputUSD:estUsd } };
 
-    if (API_ENDPOINT === '/ask-ai') await streamAskAI(fd, meta); else await postMock(fd, meta);
+    if (API_ENDPOINT === '/ask-ai') {
+      // Ensure key, then stream
+      if (!ACCESS_KEY) {
+        const ok = await ensureAccessKeyInteractive();
+        if (!ok) return;
+      }
+      await streamAskAI(fd, meta);
+    } else {
+      await postMock(fd, meta);
+    }
   }
 
   async function postMock(fd, meta){
@@ -455,7 +528,14 @@ window.addEventListener('DOMContentLoaded', () => {
     if (currentAbort?.signal?.aborted) currentAbort=null;
     try{
       currentAbort = new AbortController();
-      const res = await fetch('/ask-ai/stream',{method:'POST',body:fd,signal:currentAbort.signal});
+      const res = await fetch('/ask-ai/stream', withKeyHeaders({ method:'POST', body:fd, signal:currentAbort.signal }));
+      if (res.status === 401) {
+        // key expired/wrong; prompt and retry once
+        ACCESS_KEY = ''; localStorage.removeItem('mc_key');
+        const ok = await ensureAccessKeyInteractive();
+        if (!ok) throw new Error('Unauthorized');
+        return await streamAskAI(fd, meta);
+      }
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
       const reader = res.body.getReader(); const decoder = new TextDecoder('utf-8'); let buffer='';
 
@@ -470,7 +550,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
           if (data === '[DONE]'){
             if (!gotAny || !full.trim()) {
-              const r2 = await fetch('/ask-ai', { method:'POST', body: copyFD(fd) });
+              const r2 = await fetch('/ask-ai', withKeyHeaders({ method:'POST', body: copyFD(fd) }));
               const j2 = await r2.json(); const fallback = j2.aiResponse || j2.response || '';
               full = fallback; html(bubble, renderMarkdown(fallback)); highlightBubble(bubble);
             }
@@ -497,7 +577,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
       if (!gotAny || !full.trim()) {
         try {
-          const r2 = await fetch('/ask-ai', { method:'POST', body: copyFD(fd) });
+          const r2 = await fetch('/ask-ai', withKeyHeaders({ method:'POST', body: copyFD(fd) }));
           const j2 = await r2.json(); const fallback = j2.aiResponse || j2.response || '';
           full = fallback; html(bubble, renderMarkdown(fallback)); highlightBubble(bubble);
         } catch (e) { txt(bubble, '⚠️ Stream ended with no content and fallback failed.'); }
@@ -508,7 +588,7 @@ window.addEventListener('DOMContentLoaded', () => {
     } catch (e) {
       if (e.name==='AbortError'||/aborted/i.test(e.message||'')){ txt(bubble, (bubble.textContent||'') + (bubble.textContent.endsWith('[stopped]')?'':'\n\n[stopped]')); }
       else {
-        try { const r2 = await fetch('/ask-ai', { method:'POST', body: copyFD(fd) });
+        try { const r2 = await fetch('/ask-ai', withKeyHeaders({ method:'POST', body: copyFD(fd) }));
           const j2 = await r2.json(); const fallback = j2.aiResponse || j2.response || '';
           html(bubble, renderMarkdown(fallback)); highlightBubble(bubble);
           conversation.messages.push({ role:'assistant', content: fallback, meta });
@@ -555,113 +635,50 @@ window.addEventListener('DOMContentLoaded', () => {
       lines.push(`Style profile included: ${meta.included.profile?'Yes':'No'}`);
       if(meta.included.uploads?.length) lines.push(`Uploads (this message): ${meta.included.uploads.join(', ')}`);
       if(meta.included.chatFiles?.length) lines.push(`Chat files: ${meta.included.chatFiles.join(', ')}`);
-      if(meta.included.pinned?.length) lines.push(`Pinned (global): ${meta.included.pinned.join(', ')}`);
-      lines.push(`Estimated input: ~${meta.est.inputTokens} tok • ${curSymbol()}${fmtMoney(toLocal(meta.est.inputUSD))}`);
-      details.textContent = lines.join('\n'); metaWrap.appendChild(btn); metaWrap.appendChild(details); msg.appendChild(metaWrap);
+      if(meta.included.pinned?.length) lines.push(`Pinned library: ${meta.included.pinned.join(', ')}`);
+      lines.push(`Est. input: ~${meta.est.inputTokens} tok • ~US$${meta.est.inputUSD.toFixed(4)}`);
+      details.textContent = lines.join('\n');
+      metaWrap.appendChild(btn); metaWrap.appendChild(details); msg.appendChild(metaWrap);
     }
-    chatEl.appendChild(msg); chatEl.scrollTop = chatEl.scrollHeight;
+
+    chatEl.appendChild(msg);
+    chatEl.scrollTop = chatEl.scrollHeight;
     if (!skipMd) highlightBubble(bubble);
     return msg;
   }
 
-  function highlightBubble(bubble){ setTimeout(()=>{ try { Prism && Prism.highlightAllUnder && Prism.highlightAllUnder(bubble); } catch(e){ /* no prism */ } }, 0); }
-  function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 
-  // ---- NEW: streaming-safe Markdown renderer (preserves code fences & newlines) ----
-  function renderMarkdown(md) {
+  function renderMarkdown(md){
     if (!md) return '';
-
-    const L = md.replace(/\r\n/g, '\n').split('\n');
-    const html = [];
-    let inFence = false;
-    let fenceLang = '';
-    let fenceBuf = [];
-    let paraBuf = [];
-
-    const escape = (s) =>
-      (s || '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-
-    const flushPara = () => {
-      if (!paraBuf.length) return;
-      const raw = paraBuf.join('\n');
-
-      // inline inside paragraphs
-      let p = raw
-        .replace(/`([^`]+)`/g, (_, c) => `<code>${escape(c)}</code>`)
-        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-        .replace(/\*([^*]+)\*/g, '<em>$1</em>');
-
-      // headings
-      p = p.replace(/^### (.+)$/gm, '<h3>$1</h3>')
-           .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-           .replace(/^# (.+)$/gm, '<h1>$1</h1>');
-
-      // simple bullets
-      if (/^\s*-\s+/.test(p)) {
-        const items = p.split('\n').filter(Boolean)
-          .map(line => line.replace(/^\s*-\s+/, ''))
-          .map(li => `<li>${li}</li>`).join('');
-        html.push(`<ul>${items}</ul>`);
-      } else {
-        html.push(`<p>${p.replace(/\n/g, '<br>')}</p>`);
-      }
-      paraBuf = [];
-    };
-
-    for (let i = 0; i < L.length; i++) {
-      const line = L[i];
-
-      // code fence open/close
-      const m = line.match(/^```(\w+)?\s*$/);
-      if (m) {
-        if (inFence) {
-          const code = fenceBuf.join('\n');
-          const lang = (fenceLang || '').toLowerCase();
-          html.push(`<pre><code class="language-${lang}">${escape(code)}</code></pre>`);
-          inFence = false; fenceLang = ''; fenceBuf = [];
-        } else {
-          flushPara();
-          inFence = true; fenceLang = m[1] || ''; fenceBuf = [];
-        }
-        continue;
-      }
-
-      if (inFence) {
-        fenceBuf.push(line);
-        continue;
-      }
-
-      if (line.trim() === '') {
-        flushPara();
-      } else {
-        paraBuf.push(line);
-      }
-    }
-
-    // end
-    if (inFence) {
-      // render incomplete fence as code (useful during streaming)
-      const code = fenceBuf.join('\n');
-      html.push(`<pre><code class="language-${(fenceLang || '').toLowerCase()}">${escape(code)}</code></pre>`);
-    } else {
-      flushPara();
-    }
-
-    return html.join('\n');
+    // Code blocks ```lang\n...\n```
+    md = md.replace(/```(\w+)?\n([\s\S]*?)```/g, (m,lang,code)=>{
+      const langClass = lang ? `language-${lang}` : '';
+      return `<pre><code class="${langClass}">${escapeHtml(code)}</code></pre>`;
+    });
+    // Inline code
+    md = md.replace(/`([^`]+)`/g, (_,code)=>`<code>${escapeHtml(code)}</code>`);
+    // Headings
+    md = md.replace(/^(#{1,3})\s*(.+)$/gm, (_,h,txt)=>`<h${h.length}>${escapeHtml(txt)}</h${h.length}>`);
+    // Bold/italic
+    md = md.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    md = md.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    // Paragraphs
+    md = md.replace(/(^|\n)(?!<h\d>|<pre>|<ul>|<ol>|<li>|<\/)([^\n][^\n]*)/g, (m,pfx,para)=>{
+      if (para.trim().startsWith('<')) return m; // already HTML
+      return `${pfx}<p>${para}</p>`;
+    });
+    return md;
   }
 
-  // ---- Delete all chats ----
-  bind(deleteAllBtn, 'click', () => {
-    if (!confirm('Delete ALL chats locally?')) return;
-    const all = JSON.parse(localStorage.getItem('history') || '[]');
-    for (const c of all) localStorage.removeItem(`conv:${c.id}`);
-    localStorage.removeItem('history');
-    newChat();
-  });
+  function highlightBubble(el){
+    if (window.Prism && el) {
+      try { Prism.highlightAllUnder(el); } catch {}
+    }
+  }
 
-  console.log('[App] UI ready.');
+  // Done boot
 });
+
+// (no exports)
 

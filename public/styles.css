@@ -143,14 +143,5 @@ dialog::backdrop { background: rgba(0,0,0,.35); }
   border: 1px solid #1e2638;
   border-radius: 10px;
   padding: 12px 14px;
-  overflow: auto;
-  line-height: 1.35;
-}
-.bubble code {
-  background: #0f1630;
-  color: #e9edff;
-  border: 1px solid #1e2342;
-  padding: 2px 6px;
-  border-radius: 6px;
 }
 

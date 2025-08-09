@@ -1,8 +1,8 @@
 // ================================
 // MyCoder Backend (index.js)
 // ================================
-
 require('dotenv').config();
+
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
@@ -32,22 +32,40 @@ for (const d of [DATA_DIR, CHAT_DIR, LIB_DIR, TMP_DIR]) {
 // ---- Multer temp upload
 const upload = multer({ dest: TMP_DIR });
 
-// ---- OpenAI
+// ---- Secrets & OpenAI
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_BASE = process.env.OPENAI_BASE || 'https://api.openai.com';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o'; // high-end
-const PER_TOKEN_USD = 0.000002; // loose estimate for input tokens; you can tune per model
+const PER_TOKEN_USD = 0.000002; // rough input token estimate
+const ACCESS_KEY = process.env.MYCODER_PASSWORD || ''; // protects only the real endpoints
 
+// ---- Access-key guard: only for /ask-ai* (real API)
+function requireKey(req, res, next) {
+  if (!ACCESS_KEY) {
+    return res.status(503).json({ error: 'Real API disabled (no MYCODER_PASSWORD set).' });
+  }
+  const incoming = req.get('x-mycoder-key') || req.query.key;
+  if (incoming && incoming === ACCESS_KEY) return next();
+  return res.status(401).json({ error: 'Unauthorized' });
+}
+
+// Tiny verification endpoint for front-end login modal
+app.post('/auth/verify', (req, res) => {
+  const key = req.body?.key;
+  if (!ACCESS_KEY) return res.status(503).json({ ok: false, error: 'Real API disabled' });
+  if (key && key === ACCESS_KEY) return res.json({ ok: true });
+  return res.status(401).json({ ok: false, error: 'Invalid key' });
+});
+
+// ---- Util
 function assertApiKey() {
   if (!OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY in .env');
 }
-
-// ---- Util
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-function safeName(name) {
-  return name.replace(/[^\w.\-()+\s]/g, '_');
-}
+function safeName(name) { return (name||'').replace(/[^\w.\-()+\s]/g, '_'); }
+async function ensureDir(p) { await fsp.mkdir(p, { recursive: true }); }
+function tokensFromChars(chars) { return Math.ceil(chars / 4); }
+function truncateByBudget(str, maxChars) { return (str.length <= maxChars) ? str : (str.slice(0, maxChars) + '\n\n[truncated]'); }
 
 async function extractText(filePath, originalname, mimetype) {
   const ext = (path.extname(originalname || '').toLowerCase());
@@ -61,7 +79,6 @@ async function extractText(filePath, originalname, mimetype) {
     } else if (ext === '.txt' || mimetype?.startsWith('text/')) {
       return fs.readFileSync(filePath, 'utf8');
     } else {
-      // Fallback: try utf8 read
       try { return fs.readFileSync(filePath, 'utf8'); }
       catch { return ''; }
     }
@@ -69,20 +86,6 @@ async function extractText(filePath, originalname, mimetype) {
     console.warn('extractText failed for', originalname, e.message);
     return '';
   }
-}
-
-function tokensFromChars(chars) {
-  // rough rule of thumb ~4 chars per token
-  return Math.ceil(chars / 4);
-}
-
-function truncateByBudget(str, maxChars) {
-  if (str.length <= maxChars) return str;
-  return str.slice(0, maxChars) + '\n\n[truncated]';
-}
-
-async function ensureDir(p) {
-  await fsp.mkdir(p, { recursive: true });
 }
 
 async function listChatFiles(chatId) {
@@ -98,20 +101,14 @@ async function listChatFiles(chatId) {
     return [];
   }
 }
-
 async function readPinnedIds() {
   const pinPath = path.join(LIB_DIR, '.pins.json');
-  try {
-    return JSON.parse(await fsp.readFile(pinPath, 'utf8'));
-  } catch {
-    return [];
-  }
+  try { return JSON.parse(await fsp.readFile(pinPath, 'utf8')); } catch { return []; }
 }
 async function writePinnedIds(arr) {
   const pinPath = path.join(LIB_DIR, '.pins.json');
   await fsp.writeFile(pinPath, JSON.stringify(arr || []), 'utf8');
 }
-
 async function listLibrary() {
   const pinIds = await readPinnedIds();
   const files = await fsp.readdir(LIB_DIR);
@@ -121,28 +118,17 @@ async function listLibrary() {
     const p = path.join(LIB_DIR, f);
     const st = await fsp.stat(p);
     if (!st.isFile()) continue;
-    rows.push({
-      id: f,
-      filename: f,
-      size: st.size,
-      pinned: pinIds.includes(f),
-      collection: '' // extension point
-    });
+    rows.push({ id: f, filename: f, size: st.size, pinned: pinIds.includes(f), collection: '' });
   }
   return rows;
 }
 
 // ===================================
-// Simple endpoints for library & chat
+// Library & chat file endpoints
 // ===================================
-
-// List library files
 app.get('/api/library', async (req, res) => {
-  try { res.json(await listLibrary()); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try { res.json(await listLibrary()); } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Upload into library
 app.post('/api/library/upload', upload.array('files'), async (req, res) => {
   try {
     for (const f of req.files || []) {
@@ -150,12 +136,8 @@ app.post('/api/library/upload', upload.array('files'), async (req, res) => {
       await fsp.rename(f.path, dest);
     }
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Pin/unpin
 app.post('/api/library/pin', async (req, res) => {
   try {
     const chunks = [];
@@ -168,12 +150,8 @@ app.post('/api/library/pin', async (req, res) => {
       await writePinnedIds(next);
       res.json({ ok: true, pinned: next });
     });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Delete library file
 app.delete('/api/library/:id', async (req, res) => {
   try {
     const id = safeName(req.params.id);
@@ -181,20 +159,14 @@ app.delete('/api/library/:id', async (req, res) => {
     const pins = await readPinnedIds();
     await writePinnedIds(pins.filter(x => x !== id));
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// List chat files
 app.get('/api/chat/files', async (req, res) => {
   const { chatId } = req.query;
   if (!chatId) return res.json([]);
   const rows = await listChatFiles(chatId);
   res.json(rows.map(r => ({ name: r.name, size: r.size })));
 });
-
-// Delete chat file
 app.delete('/api/chat/files/:name', async (req, res) => {
   const { chatId } = req.query;
   const name = req.params.name;
@@ -202,9 +174,7 @@ app.delete('/api/chat/files/:name', async (req, res) => {
   try {
     await fsp.unlink(path.join(CHAT_DIR, chatId, name));
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // =====================
@@ -216,23 +186,20 @@ app.post('/api/estimate', upload.array('files'), async (req, res) => {
     let chars = prompt.length + styleProfile.length;
 
     for (const f of req.files || []) {
-      // very rough: size → chars
-      chars += Math.min(400000, Math.max(1000, f.size)); // cap so it doesn't explode
+      chars += Math.min(400000, Math.max(1000, f.size));
       fs.unlinkSync(f.path);
     }
 
     const tokens = tokensFromChars(chars);
     const inputCostUSD = tokens * PER_TOKEN_USD;
     res.json({ tokens, inputCostUSD });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ======================
 // Non-streaming fallback
 // ======================
-app.post('/ask-ai', upload.array('files'), async (req, res) => {
+app.post('/ask-ai', requireKey, upload.array('files'), async (req, res) => {
   try {
     assertApiKey();
     const {
@@ -241,7 +208,7 @@ app.post('/ask-ai', upload.array('files'), async (req, res) => {
       styleProfile = '',
       retrieval = 'semantic',
       ragK = '24',
-      ragBudget = '48000', // chars
+      ragBudget = '48000',
       srcUploads = '1',
       srcChat = '1',
       srcLibrary = '1',
@@ -251,7 +218,6 @@ app.post('/ask-ai', upload.array('files'), async (req, res) => {
       critique = '0'
     } = req.body || {};
 
-    // Collect context
     const context = await buildContext({
       chatId,
       uploaded: req.files || [],
@@ -261,7 +227,6 @@ app.post('/ask-ai', upload.array('files'), async (req, res) => {
       ragBudget: Number(ragBudget)
     });
 
-    // Compose prompt
     const sys = systemPrompt({ mode, depth, critique });
     const user = userPrompt({ prompt, styleProfile, context, retrieval, ragK: Number(ragK), maxTokens: Number(maxTokens) });
 
@@ -276,7 +241,7 @@ app.post('/ask-ai', upload.array('files'), async (req, res) => {
       max_tokens: Math.max(256, Math.min(8192, Number(maxTokens) || 4096))
     }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } });
 
-    // Cleanup temps
+    // Cleanup temp uploads
     for (const f of req.files || []) try { fs.unlinkSync(f.path); } catch {}
 
     res.json({ aiResponse: r.data.choices?.[0]?.message?.content || '' });
@@ -289,28 +254,24 @@ app.post('/ask-ai', upload.array('files'), async (req, res) => {
 // ==================
 // Streaming endpoint
 // ==================
-app.post('/ask-ai/stream', upload.array('files'), async (resReq, resRes) => {
+app.post('/ask-ai/stream', requireKey, upload.array('files'), async (resReq, resRes) => {
   try {
     assertApiKey();
-    // We’ll manage the response manually (SSE)
     resRes.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no' // for some proxies
+      'X-Accel-Buffering': 'no'
     });
 
-    // Parse fields from multipart
-    const fields = {};
-    for (const [k, v] of Object.entries(resReq.body || {})) fields[k] = v;
-
+    const fields = { ...(resReq.body || {}) };
     const {
       prompt = '',
       chatId = 'default',
       styleProfile = '',
       retrieval = 'semantic',
       ragK = '24',
-      ragBudget = '48000', // chars
+      ragBudget = '48000',
       srcUploads = '1',
       srcChat = '1',
       srcLibrary = '1',
@@ -320,7 +281,6 @@ app.post('/ask-ai/stream', upload.array('files'), async (resReq, resRes) => {
       critique = '0'
     } = fields;
 
-    // Build context (extract PDFs!)
     const context = await buildContext({
       chatId,
       uploaded: resReq.files || [],
@@ -330,27 +290,23 @@ app.post('/ask-ai/stream', upload.array('files'), async (resReq, resRes) => {
       ragBudget: Number(ragBudget)
     });
 
-    // Send the snapshot first so the UI dock can show what went in
     resRes.write(`data: ${JSON.stringify({
       meta: {
         files: context.parts.map(p => ({ name: p.name, source: p.source, chars: p.text.length })),
         tokens: tokensFromChars(context.concatText.length),
         mode, depth,
-        retrievalStats: { k: Number(ragK), selected: context.parts.length, candidates: context.candidates }
+        retrievalStats: { k: Number(ragK), selected: context.parts.length, candidates: context.candidates },
+        maxTokensUsed: Math.max(256, Math.min(8192, Number(maxTokens) || 4096))
       }
     })}\n\n`);
 
     const sys = systemPrompt({ mode, depth, critique });
     const user = userPrompt({ prompt, styleProfile, context, retrieval, ragK: Number(ragK), maxTokens: Number(maxTokens) });
 
-    // Stream from OpenAI -> proxy as SSE
     const r = await axios({
       method: 'post',
       url: `${OPENAI_BASE}/v1/chat/completions`,
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       responseType: 'stream',
       data: {
         model: OPENAI_MODEL,
@@ -367,15 +323,13 @@ app.post('/ask-ai/stream', upload.array('files'), async (resReq, resRes) => {
     let gotAny = false;
     r.data.on('data', (chunk) => {
       const str = chunk.toString('utf8');
-      // Relay OpenAI's SSE directly but also emit a JSON each delta for our UI
       str.split('\n').forEach(line => {
         if (!line.trim()) return;
         if (line.startsWith('data:')) {
           const payload = line.slice(5).trim();
           if (payload === '[DONE]') {
-            resRes.write(`data: [DONE]\n\n`);
-            resRes.end();
-            return;
+            resRes.write('data: [DONE]\n\n');
+            resRes.end(); return;
           }
           try {
             const obj = JSON.parse(payload);
@@ -384,25 +338,19 @@ app.post('/ask-ai/stream', upload.array('files'), async (resReq, resRes) => {
               gotAny = true;
               resRes.write(`data: ${JSON.stringify({ delta })}\n\n`);
             }
-          } catch {
-            // ignore keepalives
-          }
+          } catch { /* ignore keepalive */ }
         }
       });
     });
 
     r.data.on('end', async () => {
       if (!gotAny) {
-        // Fallback: do a one-shot completion and return its content
         try {
           const rr = await axios.post(`${OPENAI_BASE}/v1/chat/completions`, {
             model: OPENAI_MODEL,
             stream: false,
             temperature: 0.2,
-            messages: [
-              { role: 'system', content: sys },
-              { role: 'user', content: user }
-            ],
+            messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
             max_tokens: Math.max(256, Math.min(8192, Number(maxTokens) || 4096))
           }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } });
           const content = rr.data.choices?.[0]?.message?.content || '';
@@ -420,7 +368,6 @@ app.post('/ask-ai/stream', upload.array('files'), async (resReq, resRes) => {
       resRes.write('data: [DONE]\n\n');
       resRes.end();
     });
-
   } catch (e) {
     console.error('stream error', e.message);
     try {
@@ -429,18 +376,16 @@ app.post('/ask-ai/stream', upload.array('files'), async (resReq, resRes) => {
       resRes.end();
     } catch {}
   } finally {
-    // Cleanup temp upload files
     for (const f of (resReq.files || [])) try { fs.unlinkSync(f.path); } catch {}
   }
 });
 
 // =====================
-// Mock endpoint (local)
+// Mock endpoint (public)
 // =====================
 app.post('/api/process', upload.array('files'), async (req, res) => {
   const prompt = req.body.prompt || '';
   const files = req.files || [];
-  // Echo mock
   for (const f of files) try { fs.unlinkSync(f.path); } catch {}
   res.json({ response: `Pretend AI says: "${prompt}" with ${files.length} file(s) uploaded.` });
 });
@@ -486,41 +431,37 @@ async function buildContext({ chatId, uploaded, takeUploads, takeChat, takeLibra
     }
   }
 
-  // Budgeting: keep the most recent/uploads first, then trim by char budget
-  let remaining = Math.max(2000, ragBudget || 48000); // chars
+  // Budgeting: keep order: uploads first, then chat files, then library; trim to char budget
+  let remaining = Math.max(2000, ragBudget || 48000);
   const selected = [];
   for (const part of parts) {
     if (remaining <= 0) break;
-    const take = truncateByBudget(part.text, remaining);
+    const take = part.text.length <= remaining ? part.text : part.text.slice(0, remaining);
     selected.push({ ...part, text: take });
     remaining -= take.length;
   }
 
-  const concatText = selected.map(p => `--- ${p.source.toUpperCase()}: ${p.name} ---\n${p.text}`).join('\n\n');
-
-  return {
-    parts: selected,
-    concatText,
-    candidates
-  };
+  const concatText = selected.map(p => `## [${p.source}] ${p.name}\n${p.text}`).join('\n\n');
+  return { parts: selected, concatText, candidates };
 }
 
 function systemPrompt({ mode, depth, critique }) {
   return [
-    `You are MyCoder, a coding assistant.`,
-    `You ALWAYS use the provided CONTEXT when it exists.`,
-    `Never say "I can't open PDFs" — the relevant text has already been extracted for you.`,
-    `Cite filenames when you rely on specific parts.`,
-    `Mode=${mode}, Depth=${depth}, Critique=${critique === '1' ? 'on' : 'off'}.`,
-    `Be explicit, produce complete, compilable code, and explain the plan first when appropriate.`
+    'You are MyCoder, a rigorous coding assistant.',
+    'Always produce clear, compilable code with explanations.',
+    `Mode: ${mode}. Depth: ${depth}. Critique pass: ${critique==='1'?'enabled':'disabled'}.`,
+    'When given a PDF/notes, align with course conventions and the user’s style profile.',
+    'Prefer step-by-step planning for larger tasks, and show structure (files, classes) before code.'
   ].join(' ');
 }
 
 function userPrompt({ prompt, styleProfile, context, retrieval, ragK, maxTokens }) {
-  const style = styleProfile ? `\n\n[STYLE PROFILE]\n${styleProfile}\n` : '';
-  const ctx = context?.concatText ? `\n\n[CONTEXT]\n${context.concatText}\n` : '';
-  const guide = `\n\n[GUIDANCE]\nRetrieval=${retrieval}, k=${ragK}, maxTokens=${maxTokens}. Use the style profile. Prefer the class/lib APIs shown in context.`;
-  return `${prompt}${style}${ctx}${guide}`;
+  const pro = prompt || '';
+  const style = styleProfile ? `\n\n### Style Profile\n${styleProfile}\n` : '';
+  const ctx = context?.concatText ? `\n\n### Context (${retrieval}, k=${ragK}, maxOut=${maxTokens})\n${context.concatText}\n` : '';
+  const ask = `\n\n### Task\n${pro}\n`;
+  const instr = '\n\n### Instructions\nReturn well-formatted Markdown with code blocks using proper language tags.';
+  return `${style}${ctx}${ask}${instr}`;
 }
 
 // ----------------
